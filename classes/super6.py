@@ -2,6 +2,7 @@ import aiohttp
 import asyncio
 import itertools
 import json
+import time
 
 from classes.prediction import Prediction
 from classes.result import Result
@@ -14,17 +15,38 @@ from typing import List
 from utils import *
 
 
+def retry_on_locked(func):
+    def wrapper(*args, **kwargs):
+        retries = 5
+        while retries > 0:
+            try:
+                return func(*args, **kwargs)
+            except sqlite3.OperationalError as e:
+                if "database is locked" in str(e):
+                    retries -= 1
+                    time.sleep(0.1)  # Wait before retrying
+                else:
+                    raise
+        raise sqlite3.OperationalError("Database is locked after multiple retries")
+    return wrapper
+
+
 class Super6:
     def __init__(self, session: aiohttp.client.ClientSession) -> None:
         self.session = session
+        self.conn = sqlite3.connect("database.db", check_same_thread=False)
+        self.conn.execute("PRAGMA journal_mode=WAL;")  # Enable WAL mode for concurrent reads/writes
+        self.cursor = self.conn.cursor()
+
         exists = path.exists("database.db")
-        with sqlite3.connect("database.db") as conn:
-            cursor = conn.cursor()
-            if not exists:
-                initialise_database(cursor)
+        if not exists:
+            initialise_database(self.cursor)
 
         ignored = read_from_csv("ignored_challenge_ids")
-        delete_from_results(cursor, challenge_ids=ignored)
+        delete_from_results(self.cursor, challenge_ids=ignored)
+
+    def __del__(self):
+        self.conn.close()
 
     async def get_results(self, round_number: int) -> List[Result]:
         '''Returns a list of Result objects from the specified round number'''
@@ -174,18 +196,21 @@ class Super6:
         '''Updates the database with all the latest data'''
 
         active_round = await self.get_active_round()
-        with sqlite3.connect("database.db") as conn:
-            cursor = conn.cursor()
-
-            IDs_db = read_ids_from_db(cursor)
+        try:
+            IDs_db = read_ids_from_db(self.cursor)
             IDs_file = read_from_csv("IDs")
 
             to_add = [x for x in IDs_file if x not in IDs_db]
             to_delete = [x for x in IDs_db if x not in IDs_file]
 
-            last_update = get_last_update(cursor)
+            last_update = get_last_update(self.cursor)
 
-            await self.update_users(cursor, to_add, to_delete)
-            await self.update_results(cursor, last_update, active_round)
-            await self.update_predictions(cursor, last_update, active_round, to_add, to_delete, IDs_file)
-            self.update_calculations(cursor, IDs_file)
+            await self.update_users(self.cursor, to_add, to_delete)
+            await self.update_results(self.cursor, last_update, active_round)
+            await self.update_predictions(self.cursor, last_update, active_round, to_add, to_delete, IDs_file)
+            self.update_calculations(self.cursor, IDs_file)
+
+            self.conn.commit()  # Commit changes
+        except Exception as e:
+            self.conn.rollback()  # Rollback on error
+            raise e
